@@ -1,27 +1,68 @@
+from dateutil import parser
+from selenium import webdriver
+from selenium.webdriver.common.by import By
 import datetime as dt
 import asyncio
 from aiohttp import ClientSession
-from gather_links import get_file_date
+from dateutil import parser
 import pandas as pd
 import numpy as np
 import os
+import orm
+
 
 START_URL = "https://spimex.com/markets/oil_products/trades/results/"
 START_FROM = dt.datetime(2023, 1, 1).date()
 
-links = ['https://spimex.com/upload/reports/oil_xls/oil_xls_20250407162000.xls?r=7396',
-         'https://spimex.com/upload/reports/oil_xls/oil_xls_20250404162000.xls?r=4622',
-         'https://spimex.com/upload/reports/oil_xls/oil_xls_20250403162000.xls?r=7879',
-         'https://spimex.com/upload/reports/oil_xls/oil_xls_20250402162000.xls?r=2859',
-         'https://spimex.com/upload/reports/oil_xls/oil_xls_20250401162000.xls?r=9028',
-         'https://spimex.com/upload/reports/oil_xls/oil_xls_20250331162000.xls?r=4864']
+NEXT_CSS_SEL = 'li.bx-pag-next a'
+LINK_CSS_SEL = '#comp_d609bce6ada86eff0b6f7e49e6bae904 div.accordeon-inner__wrap-item a'
 
 
-async def download_file(work_queue, session):
-    url = await work_queue.get()
+chrome_options = webdriver.ChromeOptions()
+chrome_options.add_experimental_option('excludeSwitches', ['disable-popup-blocking'])
+chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+chrome_options.add_experimental_option('useAutomationExtension', False)
+
+driver = webdriver.Chrome(options=chrome_options)
+
+
+def get_file_date(file_url: str):
+    """Retrieve date from file name."""
+    date = parser.parse(file_url.split('_')[-1][:8]).date()
+    return date
+
+
+async def produce(urls: list, q: asyncio.Queue):
+    """Collect links: Add urls to queue for processing"""
+    for url in urls:
+        await q.put(url)
+
+
+async def _get_links():
+    """Collect links: Get download links from the page."""
+    link_obj = driver.find_elements(By.CSS_SELECTOR, LINK_CSS_SEL)
+    return [
+            t.get_attribute('href') for t in link_obj
+            if get_file_date(t.get_attribute('href')) >= START_FROM
+            ]
+
+
+async def grab_links(q: asyncio.Queue, url=START_URL):
+    """Collect links from url"""
+    driver.get(url)
+    str_obj = await _get_links()
+    if str_obj:
+        await produce(str_obj, q)
+        next_page = driver.find_element(By.CSS_SELECTOR, NEXT_CSS_SEL)
+        url = next_page.get_attribute('href')
+        await grab_links(q, url)
+    return q
+
+
+async def download_file(url: str, session: ClientSession):
+    """Download file from url to server."""
     query_params = {'downloadformat': 'xlsx'}
     async with session.get(url, params=query_params) as response:
-        print(response.status)
         date = get_file_date(url)
         name = f'{date}.xlsx'
         data = await response.read()
@@ -30,9 +71,9 @@ async def download_file(work_queue, session):
         return name, date
 
 
-async def retrieve_requested_data_from_file(work_queue, session):
+async def retrieve_requested_data_from_file(url: str, session: ClientSession):
     """Retrieve requested data from file."""
-    file_name, date = await download_file(work_queue, session)
+    file_name, date = await download_file(url, session)
     pre_data = pd.read_excel(file_name, usecols='B', nrows=20)
 
     row, col = np.where(pre_data == 'Единица измерения: Метрическая тонна')
@@ -53,20 +94,29 @@ async def retrieve_requested_data_from_file(work_queue, session):
     data.insert(5, 'delivery_type_id', data['exchange_product_id'].str[-1:])
     data['date'] = date
     clean_data = data[data['count'] != '-']
+    await delete_file(file_name)
     return clean_data
 
 
-def delete_file(file):
+async def delete_file(file):
     """Delete file from server."""
     os.remove(file)
 
 
-async def main():
+async def add_to_db(work_queue: asyncio.Queue, session: ClientSession):
+    """Add data to database"""
+    while not work_queue.empty():
+        url = await work_queue.get()
+        data = await retrieve_requested_data_from_file(url, session)
+        await orm.insert_data_pull_to_db(data)
+
+
+async def main(n=10):
     work_queue = asyncio.Queue()
-    for url in links:
-        await work_queue.put(url)
+    await grab_links(work_queue)
+    await orm.create_tables()
     async with ClientSession() as session:
-        await asyncio.gather(*[asyncio.create_task(retrieve_requested_data_from_file(work_queue, session)) for n in range(work_queue.qsize())])
+        await asyncio.gather(*[asyncio.create_task(add_to_db(work_queue, session)) for i in range(n)])
 
 if __name__ == "__main__":
     s = dt.datetime.now()
